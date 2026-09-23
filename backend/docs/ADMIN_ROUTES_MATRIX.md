@@ -123,6 +123,26 @@ The backend uses two primary guards for admin access control:
 
 ---
 
+### 8. Shop Admin Module
+
+**Base Path**: `/admin/shop`  
+**Controller**: `ShopAdminController`  
+**Guards**: `JwtAuthGuard`, `AdminGuard`
+
+| HTTP Method | Path | Purpose | Guard Used |
+|-------------|------|---------|------------|
+| POST | `/admin/shop/items` | Create a shop item (SKU, price in minor units) | AdminGuard |
+| PATCH | `/admin/shop/items/:id` | Update a shop item (catalog edit) | AdminGuard |
+| DELETE | `/admin/shop/items/:id` | Delete a shop item | AdminGuard |
+| PATCH | `/admin/shop/items/:id/inventory` | Adjust inventory for a SKU | AdminGuard |
+
+**Notes**:
+- All catalog mutations are audited via `AdminLogsService` (actor, SKU, before/after).
+- Prices are stored and validated in minor units; clients never supply trusted prices.
+- Inventory adjustments are atomic and must never drive stock negative.
+
+---
+
 ## Guard Implementations
 
 ### AdminGuard

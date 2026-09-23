@@ -83,6 +83,62 @@ curl -X POST http://localhost:3000/api/shop/bulk/update \
   }'
 ```
 
+## Purchases: Idempotency & Authoritative Write Path
+
+### Authoritative write path
+
+`shop-api` is the single source of truth for purchases and inventory. The backend
+acts only as a proxy/read model during the proxy canary dual-read window: it may
+forward purchase requests to `shop-api` and serve cached reads, but it must never
+mutate inventory or prices itself. All money, inventory, and purchase mutations
+are owned by `shop-api` (see `backend/docs/ADR-001-shop-purchase-ownership.md`).
+
+### Idempotency-Key contract
+
+Every purchase write MUST include an `Idempotency-Key` header. The server hashes
+the request body and stores the response keyed by `Idempotency-Key` in Redis.
+
+- First request with a key: processed, response stored with the body hash.
+- Replay with the same key and identical body hash: the stored response is
+  returned verbatim (no second purchase, no inventory change).
+- Replay with the same key but a different body hash: rejected with `409 Conflict`.
+- Keys expire after the configured idempotency TTL; after expiry a reused key is
+  treated as a new request, so clients must not reuse keys across distinct intents.
+
+```bash
+# Purchase with idempotency (safe to retry on timeout/reconnect)
+curl -X POST http://localhost:3000/api/shop/purchases \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: 8f2c1e6a-4b7d-4f0a-9c3e-2d1b5a7e9f01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sku": "premium-widget",
+    "quantity": 1,
+    "unitPriceMinor": 9999
+  }'
+```
+
+### DTO validation
+
+Purchase DTOs validate `sku` (non-empty string), `quantity` (positive integer),
+and `unitPriceMinor` (non-negative integer minor units). Unknown fields are
+rejected per policy, and the client-supplied price is never trusted as the
+source of truth — `shop-api` re-resolves the authoritative price.
+
+### Inventory atomicity
+
+Inventory is adjusted atomically in `shop-api` (DB constraint or reservation
+with TTL) so concurrent buys for the same SKU cannot oversell. Inventory must
+never go negative; on dependency outage (Postgres/Redis/shop-api/RPC) writes
+fail closed.
+
+### Error mapping & observability
+
+Errors follow `docs/API_ERROR_RESPONSE_STANDARDS.md`, `requestId` is propagated
+end-to-end, and RED metrics are emitted for the purchase path. See
+`backend/docs/SW-BE-033-redis-idempotency-replay-tests.md` for replay tests and
+`SHOP_PURCHASES_RUNBOOK.md` for operator procedures.
+
 ## Running Tests
 
 ```bash

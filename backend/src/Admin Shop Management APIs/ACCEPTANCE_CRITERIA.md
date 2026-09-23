@@ -103,6 +103,60 @@
 
 ---
 
+## ✅ Redis idempotency for shop on backend path during proxy canary dual-read
+
+### Authoritative write path:
+
+- shop-api is the single source of truth for purchases (per ADR-001).
+- The backend shop proxy is a read model / canary dual-read path only; it MUST NOT
+  mutate inventory or balances. During canary, backend reads may be served from
+  either shop-api or the legacy read model, but all writes are forwarded to shop-api.
+
+### Implementation:
+
+- `Idempotency-Key` header is required on all shop purchase writes.
+- The request body is hashed (canonical JSON, sorted keys) and stored alongside the
+  idempotency key in Redis with a TTL.
+- On replay with the same key and identical body hash, the stored response is
+  returned verbatim (same status code and payload).
+- On replay with the same key but a different body hash, the request is rejected
+  with `409 Conflict` and no state is mutated.
+- DTO validation enforces SKU (non-empty string), quantity (positive integer,
+  bounded), and minor units (integer, non-negative); unknown fields are rejected
+  (`forbidNonWhitelisted`).
+- Inventory is adjusted atomically (DB constraint / reservation with TTL) so
+  concurrent buys for the same SKU cannot oversell; inventory never goes negative.
+- `requestId` is propagated through the proxy to shop-api and included in error
+  responses per `docs/API_ERROR_RESPONSE_STANDARDS.md`.
+- RED metrics (rate, errors, duration) are emitted for the purchase path.
+- Writes fail closed when shop-api, Postgres, or Redis is unavailable.
+
+### Edge cases covered:
+
+- Concurrent duplicate requests / reconnect retries (idempotency replay).
+- Idempotency TTL expiry reuse (expired key treated as a new request).
+- shop-api timeout vs client retry (retry with same key returns stored response).
+- Concurrent checkout for the same SKU (atomic inventory adjustment).
+- Catalog edit during purchase (price read from shop-api at write time; no
+  client-trusted price).
+
+### Test Coverage:
+
+- ✅ shop-api `purchases.e2e` concurrency + `409` on payload conflict
+- ✅ Unit tests for DTO bounds (SKU, quantity, minor units, unknown fields)
+- ✅ Proxy contract test for the backend read/canary path
+- ✅ Metrics presence smoke test
+
+### Acceptance criteria:
+
+- ✅ No double purchase for one `Idempotency-Key`
+- ✅ Inventory never negative
+- ✅ Docs/runbooks updated (`SHOP_PURCHASES_RUNBOOK.md`, ADR-001/003 notes)
+- ✅ CI e2e green for purchase path
+- ✅ Fail-closed when shop-api unavailable on writes
+
+---
+
 ## Additional Features Implemented
 
 ### Full CRUD Operations:
