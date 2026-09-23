@@ -12,6 +12,7 @@ Sources of truth:
 - `backend/docs/TOKEN_REFRESH_SECURITY_GUIDE.md`
 - `backend/docs/ADR-002-games-realtime-transport.md`
 - `frontend/docs/ADR-004-session-tokens-httpOnly-cookies.md`
+- `frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md`
 - `backend/test/auth-token-security.e2e-spec.ts`
 - `backend/test/auth.e2e-spec.ts`
 
@@ -180,17 +181,54 @@ These codes are part of the client contract and must remain stable.
 - [ ] No PII in telemetry labels.
 - [ ] Rate-limit `join` and `roll`.
 - [ ] Metrics for connected sockets and rejected actions.
-- [ ] Fail-closed on dependency outage (Postgres/Redis/shop-api/RPC) for writes.
-- [ ] Deny-by-default for new WS/action surfaces.
+- [ ] Fail-closed on dependency outage (Postgres/Redis/shop-api/RPC) for all
+      writes.
+- [ ] Reuse detection revokes the refresh family.
+- [ ] `returnTo` redirects are allowlisted only.
 
-## 16. Verification
+## 16. Mobile NEAR wallet bottom-sheet checklist automation notes
 
-- `backend/test/auth-token-security.e2e-spec.ts` — rotation, reuse detection,
-  family revocation, cookie flags, CSRF.
-- `backend/test/auth.e2e-spec.ts` — login, refresh, logout, role access.
-- Unit tests — signature verification negatives, replayed nonce, forged
-  `account_id`; authz matrix for seat vs spectator.
-- E2E — join / roll / reconnect, including `game-idempotency.e2e`.
-- Confirm cookie-only, header-only, and both-present handshakes all succeed and
-  resolve to the same principal.
-- Frontend RTL — wallet reject path creates no session.
+Automation notes for the Mobile NEAR wallet bottom-sheet flow (issue #1814).
+These notes are the operational companion to
+`frontend/docs/NEAR_WALLET_TESTNET_CHECKLIST.md` and describe how the
+bottom-sheet checklist is exercised in CI and what the automation must assert.
+
+### 16.1 Bottom-sheet flow
+
+1. User taps **Connect NEAR wallet** on mobile; the bottom-sheet opens.
+2. The sheet requests a challenge nonce from the API (§6) and renders the
+   checklist steps (wallet detected, account selected, signature requested,
+   signature verified, session established).
+3. On success the sheet closes and the session cookie is set (§1).
+4. On user rejection the sheet shows a non-blocking error and no session is
+   created; the nonce is discarded (§6).
+
+### 16.2 Automation assertions
+
+- Challenge issuance is throttled per IP and per account; a burst of requests
+  returns `429` and never leaks whether an account exists.
+- The signed payload is domain-separated and binds `account_id`; a signature
+  over a different domain or account fails verification.
+- A replayed nonce is rejected and the nonce is consumed on first successful
+  verify.
+- The user-reject path creates no session and leaves no auth cookies set.
+- The bottom-sheet checklist steps map 1:1 to the assertions above so a failing
+  step names the exact check that failed.
+
+### 16.3 Test coverage
+
+- `auth-token-security.e2e` — cookie transport, rotation, reuse detection.
+- `auth.e2e` — challenge/nonce issuance, verify, replay rejection.
+- Unit signature-verify negatives — wrong domain, wrong `account_id`, tampered
+  payload.
+- Frontend RTL wallet-reject path — bottom-sheet shows error, no session.
+
+### 16.4 Failure modes specific to the bottom-sheet
+
+| Condition                | Behavior                                          |
+| ------------------------ | ------------------------------------------------- |
+| User rejects sign        | No session, nonce discarded, sheet shows error    |
+| Replayed nonce           | `401`, nonce already consumed                     |
+| Parallel refresh         | One succeeds, others treated as reuse (§4)        |
+| Open redirect attempt    | `400`, `returnTo` not allowlisted (§7)            |
+| Challenge burst          | `429`, throttled per IP and account (§6)          |
