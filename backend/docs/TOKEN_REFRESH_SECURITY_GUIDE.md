@@ -35,7 +35,33 @@ AUTH_REFRESH_COOKIE_NAME=tycoon_rt
 CSRF_COOKIE_NAME=tycoon_csrf
 CSRF_HEADER_NAME=x-csrf-token
 
-# NEAR challenge/nonce issuance (issue #1809)
+# NEAR wallet challenge/nonce hardening (SW-FE-005/039)
+
+NEAR_CHALLENGE_TTL_SECONDS=300
+NEAR_CHALLENGE_MAX_PER_WINDOW=10
+NEAR_CHALLENGE_WINDOW_SECONDS=60
+NEAR_AUTH_DOMAIN=tycoon.example
+```
+
+## Key Changes for Developers
+
+### 1. Token Storage
+
+**Before:**
+```typescript
+// Tokens stored in plaintext
+token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+**After:**
+```typescript
+// Tokens stored as SHA-256 hashes
+tokenHash: "ebd917958fc7b45aa35d972f7babc2331c0776a2aed01a6d54f799d0407735"
+```
+
+### 1a. Client Session Storage Direction
+
+The frontend must n
 NEAR_CHALLENGE_TTL_SECONDS=300
 NEAR_CHALLENGE_MAX_PER_WINDOW=10
 NEAR_CHALLENGE_WINDOW_SECONDS=60
@@ -245,7 +271,9 @@ prevent open redirects.
 const ALLOWED_RETURN_PREFIXES = ['/', '/games', '/shop', '/profile'];
 
 function safeReturnTo(value: string | undefined): string {
-  if (!value || !value.startsWith('/') || value.startsWith('//')) return '/';
+  if (!value || !value.startsWith('/') || value.startsWith('//')) {
+    return '/';
+  }
   if (value.includes('\\')) return '/';
   const normalized = new URL(value, 'https://tycoon.example').pathname;
   const allowed = ALLOWED_RETURN_PREFIXES.some(
@@ -262,69 +290,67 @@ Rules:
   backslash-smuggled (`/\evil.com`) values fall back to `/`.
 - The allowlist is deny-by-default: new destinations must be added explicitly.
 
-## NEAR Wallet Challenge / Nonce Flow
+## NEAR Wallet Challenge / Nonce Hardening (SW-FE-033)
 
-The Mobile NEAR wallet bottom-sheet signs a server-issued challenge. The
-challenge is domain-separated and bound to the requesting `account_id` so a
-signature cannot be replayed against another account or origin.
+The NEAR wallet login flow issues a server-generated challenge (nonce) that the
+wallet signs. The signature is verified server-side with domain separation and
+bound to the `account_id`; challenges are single-use and throttled.
 
 ### Challenge issuance
 
+- The server generates a cryptographically random nonce and stores it with a
+  TTL (`NEAR_CHALLENGE_TTL_SECONDS`, default 300s).
+- The challenge message is domain-separated using `NEAR_AUTH_DOMAIN` so a
+  signature produced for one origin cannot be replayed against another.
+- Challenges are single-use: a nonce is consumed on first verification attempt
+  and rejected thereafter (replayed nonce => `401`).
+- Issuance is throttled per account/IP
+  (`NEAR_CHALLENGE_MAX_PER_WINDOW` per `NEAR_CHALLENGE_WINDOW_SECONDS`).
+
 ```typescript
-// Domain-separated, account-bound, single-use nonce.
-const nonce = randomBytes(32).toString('hex');
+// Domain-separated challenge message
 const message = [
-  `${NEAR_AUTH_DOMAIN} wants you to sign in with your NEAR account:`,
+  `${config.NEAR_AUTH_DOMAIN} wants you to sign in with your NEAR account:`,
   accountId,
   `Nonce: ${nonce}`,
-  `Issued At: ${new Date().toISOString()}`,
+  `Issued At: ${issuedAt}`,
 ].join('\n');
-
-await this.challengeStore.set(nonce, { accountId, message }, NEAR_CHALLENGE_TTL_SECONDS);
-```
-
-### Throttling
-
-Challenge issuance is rate-limited per IP and per `account_id` using the
-windowed counters below. Exceeding the window returns `429 Too Many Requests`
-and does not mint a nonce.
-
-```typescript
-await this.throttle.assertWithinLimit({
-  key: `near-challenge:${ip}:${accountId}`,
-  max: NEAR_CHALLENGE_MAX_PER_WINDOW,
-  windowSeconds: NEAR_CHALLENGE_WINDOW_SECONDS,
-});
 ```
 
 ### Signature verification
 
+- Verify the NEAR signature against the public key registered for the claimed
+  `account_id`; reject if the account does not own the key.
+- Bind the verified `account_id` into the issued session — never trust a
+  client-supplied account id without a matching signature.
+- Fail-closed: any verification error (bad signature, expired/consumed nonce,
+  unknown account) rejects the login and issues no tokens.
+- A user rejecting the wallet signature is a normal negative path: no session is
+  created and no tokens are issued.
+
 ```typescript
-// 1. Nonce must exist and be unconsumed (single-use).
-const challenge = await this.challengeStore.consume(nonce);
-if (!challenge) throw new UnauthorizedException('Unknown or replayed nonce');
-
-// 2. The signed message must match the issued, domain-separated message.
-if (signedMessage !== challenge.message) {
-  throw new UnauthorizedException('Challenge mismatch');
+// Verification contract (fail-closed)
+const challenge = await this.consumeChallenge(nonce); // single-use
+if (!challenge || challenge.expiresAt < now) {
+  throw new UnauthorizedException('Challenge expired or already used');
 }
-
-// 3. The signature must verify against the bound account_id public key.
-const ok = await verifyNearSignature({
-  accountId: challenge.accountId,
+const ok = verifySignature({
   message: challenge.message,
-  publicKey,
   signature,
+  publicKey,
+  accountId: challenge.accountId,
 });
 if (!ok) throw new UnauthorizedException('Invalid NEAR signature');
 ```
 
-Failure modes handled here:
+### Failure modes
 
-- **User rejects sign** — no signature is returned; the client surfaces the
-  rejection and the nonce is left to expire (never auto-consumed).
-- **Replayed nonce** — `consume` is atomic; a second use finds no entry and is
-  rejected.
+- **Replayed nonce** — consumed nonce is rejected; no tokens issued.
+- **User rejects sign** — no challenge consumption side effects beyond TTL
+  expiry; the client may request a fresh challenge.
+- **Parallel refresh** — serialize refreshes client-side; the server's rotation
+  rule revokes the family on a raced reuse.
+- **Open redirect attempts** — `returnTo` is validated by `safeReturnTo` above.
 - **Forged account session** — the signature is bound to `account_id` and the
   domain-separated message, so a signature for one account/origin cannot mint a
   session for another.
@@ -333,10 +359,19 @@ Failure modes handled here:
 
 ### "Token reuse detected" errors
 
-This means a refresh token was used more than once. Causes:
+This means a refresh token was used more than once. Common causes:
 
-- Parallel refresh requests from the same client (serialize refreshes).
-- A stolen token being replayed (family is revoked; user must re-auth).
+1. **Parallel refresh requests** — the client fired multiple refreshes at once.
+   Serialize refreshes so only one is in flight.
+2. **Stale token after rotation** — the client kept using an old token. Always
+   store the newest token returned by the refresh response.
+3. **Token theft** — an attacker replayed a stolen token. The family is revoked
+   and the user must re-authenticate.
+
+### Users logged out unexpectedly
+
+If reuse detection fires spuriously, check for parallel refresh races and ensure
+clients persist the rotated token before issuing the next request.
 
 ### Cookies not being set
 
