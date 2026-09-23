@@ -157,6 +157,46 @@
 
 ---
 
+## ✅ Purchases cleanup indexes migration verified
+
+### Authoritative write path:
+
+- shop-api owns the purchases schema and its migrations (`shop-api/src/migrations/`).
+- The cleanup indexes migration is the source of truth for purchase lookup and
+  idempotency-replay performance; the backend proxy never creates or alters these
+  indexes.
+
+### Implementation:
+
+- The purchases cleanup indexes migration is applied and verified before the
+  purchase write path is enabled; a partial or unapplied migration fails closed.
+- Indexes cover the idempotency key lookup (key + body hash) and the per-SKU
+  inventory/oversell guard so concurrent buys resolve without full scans.
+- Migration verification is idempotent: re-running it on an already-migrated
+  database is a no-op and does not drop or duplicate indexes.
+- Index names and columns match the migration file in `shop-api/src/migrations/`;
+  no ad-hoc index creation is performed at runtime.
+
+### Edge cases covered:
+
+- Partial migration / canary states (verification detects missing indexes and
+  blocks writes until the migration completes).
+- Re-run after rollback (verification is safe to repeat).
+
+### Test Coverage:
+
+- ✅ Migration verification smoke test asserts the cleanup indexes exist
+- ✅ shop-api `purchases.e2e` concurrency + `409` still green with indexes applied
+
+### Acceptance criteria:
+
+- ✅ Cleanup indexes migration verified before purchase writes are enabled
+- ✅ No double purchase for one `Idempotency-Key`
+- ✅ Inventory never negative
+- ✅ Fail-closed when the migration is partial or unapplied
+
+---
+
 ## Additional Features Implemented
 
 ### Full CRUD Operations:

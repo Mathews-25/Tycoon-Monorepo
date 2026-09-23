@@ -143,6 +143,27 @@ The backend uses two primary guards for admin access control:
 
 ---
 
+### 9. Shop Purchases Module (shop-api)
+
+**Base Path**: `/shop/purchases`  
+**Controller**: `ShopPurchasesController` (shop-api)  
+**Guards**: `JwtAuthGuard` (player auth); service-to-service calls use API-key auth only
+
+| HTTP Method | Path | Purpose | Guard Used |
+|-------------|------|---------|------------|
+| POST | `/shop/purchases` | Authoritative purchase write path (requires `Idempotency-Key`) | JwtAuthGuard |
+| GET | `/shop/purchases/:id` | Read a purchase by id (read model) | JwtAuthGuard |
+
+**Notes**:
+- shop-api is the single source of truth for purchases; the backend proxies reads/writes and never trusts client-supplied prices.
+- `Idempotency-Key` is required on `POST /shop/purchases`. The request body hash is stored with the key; replays return the stored response, and a payload mismatch for the same key returns `409 Conflict`.
+- Inventory is adjusted atomically (constraint / reservation TTL) so concurrent buys for the same SKU cannot oversell and stock never goes negative.
+- DTO validation enforces SKU, quantity, and minor-unit bounds and rejects unknown fields.
+- `requestId` is propagated end-to-end; errors map to `docs/API_ERROR_RESPONSE_STANDARDS.md`; RED metrics are emitted for the purchase path.
+- Writes fail closed when shop-api (or its Postgres/Redis dependencies) is unavailable.
+
+---
+
 ## Guard Implementations
 
 ### AdminGuard

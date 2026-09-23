@@ -139,6 +139,26 @@ end-to-end, and RED metrics are emitted for the purchase path. See
 `backend/docs/SW-BE-033-redis-idempotency-replay-tests.md` for replay tests and
 `SHOP_PURCHASES_RUNBOOK.md` for operator procedures.
 
+### Cleanup indexes migration
+
+`shop-api/src/migrations/` owns the purchases cleanup indexes migration. It adds
+the indexes that keep idempotency replay lookups and inventory reservation
+sweeps fast, and it is verified as part of the purchase path:
+
+- `purchases(idempotency_key)` — unique, backs replay lookup and the 409
+  payload-conflict check.
+- `purchases(sku, created_at)` — supports per-SKU concurrency and oversell
+  audits.
+- `inventory_reservations(expires_at)` — drives TTL cleanup of stale
+  reservations so inventory is released deterministically.
+
+Run the migration before enabling purchase writes and confirm it is applied
+(`migration verified`) in the target environment. A partial or unapplied
+migration must fail closed: purchase writes stay disabled until the indexes are
+present, since replay and oversell guarantees depend on them. Rollback notes:
+the migration is additive (index-only) and can be reverted by dropping the
+indexes without data loss.
+
 ## Running Tests
 
 ```bash
